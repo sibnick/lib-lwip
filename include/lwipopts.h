@@ -406,9 +406,12 @@ void sys_free(void *ptr);
  * too small: when the socket mailbox holds one netbuf and recv() is
  * copying another, the next received datagram cannot allocate a netbuf
  * and lwIP drops it without an error. Keep the count aligned with
- * MEMP_NUM_NETCONN.
+ * MEMP_NUM_NETCONN. An out-of-tree lwipopts.h overlay may still
+ * override this value.
  */
+#ifndef MEMP_NUM_NETBUF
 #define MEMP_NUM_NETBUF 64
+#endif
 #else
 #define LWIP_NETCONN 0
 #endif
