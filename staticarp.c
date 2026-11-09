@@ -1,0 +1,147 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+/*
+ * Static ARP entries for boot-declared peers (unikraft-gcp ticket
+ * 4ecf9dcedf).
+ *
+ * The Google Cloud fabric does not answer ARP requests for instance
+ * addresses. A guest that must reply to a peer has to map the peer to
+ * the encoded gateway MAC: 42:01 followed by the four gateway address
+ * bytes. The C1 gate apps embed the same rule in app code (ticket
+ * 73b23402f0). Apps booted through app-elfloader carry no code of
+ * their own, so this library file takes over the job.
+ *
+ * Usage: pass lwip.staticarp=<ipv4> on the kernel command line, once
+ * per peer, before the '--' app-argument separator. When the default
+ * netif gets its IPv4 address and gateway (the netdev.ip boot
+ * parameter path), every configured peer receives a static ARP entry.
+ * Without such an entry a reply to an inbound connection waits in the
+ * ARP pending queue forever: run ukg-1103-005311-601275 measured
+ * ARPQ used 3 of 4 with SYN-ACKs queued and no established
+ * connection.
+ */
+
+#include <uk/config.h>
+
+#if CONFIG_LWIP_UKNETDEV_STATICARP
+
+#include <string.h>
+
+#include <uk/print.h>
+#include <uk/init.h>
+#include <uk/libparam.h>
+
+#include "lwip/opt.h"
+#include "lwip/netif.h"
+#include "lwip/ip_addr.h"
+#include "lwip/etharp.h"
+
+#if LWIP_ARP && LWIP_NETIF_EXT_STATUS_CALLBACK
+
+#define UKG_STATICARP_MAXPEERS 8
+
+static char *staticarp[UKG_STATICARP_MAXPEERS];
+UK_LIBPARAM_PARAM_ARR_ALIAS(staticarp, staticarp, charp,
+			    UKG_STATICARP_MAXPEERS,
+			    "Peer IPv4 addresses that need a static ARP entry (42:01 gateway MAC)");
+
+static int ukg_staticarp_installed;
+
+/* Map every boot-declared peer to the encoded gateway MAC. The flag
+ * sticks only when every entry succeeded. A full ARP table makes
+ * etharp_add_static_entry() fail, so the code waits for the next netif
+ * event and retries then. Entries with an unparsable address are a
+ * fixed configuration mistake: the code reports one warning and drops
+ * them, so a retry does not repeat the message. Entries are global to
+ * the ARP table, so a later netif change cannot invalidate them, and
+ * etharp_add_static_entry() is idempotent. Ticket 5b7ed0ad6d. */
+static void ukg_staticarp_install(struct netif *nf)
+{
+	const ip4_addr_t *gw;
+	struct eth_addr gw_mac;
+	ip4_addr_t peer;
+	int i;
+	int pending = 0;
+	err_t err;
+
+	if (ukg_staticarp_installed || !nf)
+		return;
+	gw = netif_ip4_gw(nf);
+	if (!gw || ip4_addr_isany_val(*gw))
+		/* No gateway yet: wait for the next address change. */
+		return;
+
+	gw_mac.addr[0] = 0x42;
+	gw_mac.addr[1] = 0x01;
+	gw_mac.addr[2] = ip4_addr1(gw);
+	gw_mac.addr[3] = ip4_addr2(gw);
+	gw_mac.addr[4] = ip4_addr3(gw);
+	gw_mac.addr[5] = ip4_addr4(gw);
+
+	for (i = 0; i < UKG_STATICARP_MAXPEERS; i++) {
+		if (!staticarp[i])
+			continue;
+		if (ip4addr_aton(staticarp[i], &peer) != 1) {
+			uk_pr_warn("staticarp: unparsable peer %s\n",
+				   staticarp[i]);
+			staticarp[i] = NULL; /* do not retry a bad value */
+			continue;
+		}
+		err = etharp_add_static_entry(&peer, &gw_mac);
+		if (err == ERR_OK)
+			uk_pr_info("staticarp: static entry %s -> 42:01:%02x:%02x:%02x:%02x\n",
+				   staticarp[i], gw_mac.addr[2],
+				   gw_mac.addr[3], gw_mac.addr[4],
+				   gw_mac.addr[5]);
+		else {
+			uk_pr_warn("staticarp: entry for %s failed (%d), retry on the next netif event\n",
+				   staticarp[i], (int) err);
+			pending++;
+		}
+	}
+	if (pending == 0)
+		ukg_staticarp_installed = 1;
+}
+
+static void ukg_staticarp_cb(struct netif *nf, netif_nsc_reason_t reason,
+			     const netif_ext_callback_args_t *args
+			     __unused)
+{
+	if (reason & (LWIP_NSC_IPV4_ADDRESS_CHANGED |
+		      LWIP_NSC_IPV4_GATEWAY_CHANGED |
+		      LWIP_NSC_IPV4_NETMASK_CHANGED |
+		      LWIP_NSC_IPV4_SETTINGS_CHANGED |
+		      LWIP_NSC_STATUS_CHANGED))
+		ukg_staticarp_install(nf);
+}
+
+NETIF_DECLARE_EXT_CALLBACK(ukg_staticarp);
+
+static int ukg_staticarp_init(struct uk_init_ctx *ictx __unused)
+{
+	/*
+	 * The libparam array fills slots in order, so a used last slot
+	 * means at least UKG_STATICARP_MAXPEERS peers were declared.
+	 * libparam drops any further lwip.staticarp= value with no view
+	 * for the library. ukboot also clears the boot cmdline from the
+	 * boot info before library init calls run, so the exact declared
+	 * count cannot be recovered here. Warn when the array is full:
+	 * that is exactly the case where the code can drop a peer in
+	 * silence. Ticket 5b7ed0ad6d.
+	 */
+	if (staticarp[UKG_STATICARP_MAXPEERS - 1] != NULL)
+		uk_pr_warn("staticarp: all %d peer slots are used: extra lwip.staticarp= values on the command line have no effect\n",
+			   UKG_STATICARP_MAXPEERS);
+	netif_add_ext_callback(&ukg_staticarp, ukg_staticarp_cb);
+	/* liblwip_init (library init priority 0) already applied a
+	 * static netdev.ip address before this call runs, so the
+	 * address-change events are behind us. Probe the default netif
+	 * once here; a netif that comes up later still fires the
+	 * callback above.
+	 */
+	ukg_staticarp_install(netif_default);
+	return 0;
+}
+uk_lib_initcall(ukg_staticarp_init, 1);
+
+#endif /* LWIP_ARP && LWIP_NETIF_EXT_STATUS_CALLBACK */
+#endif /* CONFIG_LWIP_UKNETDEV_STATICARP */

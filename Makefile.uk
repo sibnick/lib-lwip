@@ -75,6 +75,10 @@ CINCLUDES-$(CONFIG_LIBLWIP)   += $(LIBLWIP_COMMON_INCLUDES-y)
 CXXINCLUDES-$(CONFIG_LIBLWIP) += $(LIBLWIP_COMMON_INCLUDES-y)
 $(eval $(call uknetdev_scratch_mem,$(CONFIG_LWIP_UKNETDEV_SCRATCH)))
 
+# Register libparam with the 'lwip.' prefix so lwip.staticarp=<ipv4>
+# (and other library parameters) reach staticarp.c. Ticket 4ecf9dcedf.
+$(eval $(call addlib_paramprefix,liblwip,lwip))
+
 ################################################################################
 # Library flags
 ################################################################################
@@ -135,6 +139,8 @@ LIBLWIP_SRCS-$(CONFIG_LWIP_SOCKET) += $(LIBLWIP_EXTRACTED)/api/sockets.c
 LIBLWIP_SRCS-y += $(LIBLWIP_EXTRACTED)/netif/ethernet.c
 LIBLWIP_SRCS-$(CONFIG_LWIP_UKNETDEV) += $(LIBLWIP_BASE)/netbuf.c|unikraft
 LIBLWIP_SRCS-$(CONFIG_LWIP_UKNETDEV) += $(LIBLWIP_BASE)/uknetdev.c|unikraft
+# Static ARP entries for boot-declared peers (ticket 4ecf9dcedf).
+LIBLWIP_SRCS-$(CONFIG_LWIP_UKNETDEV_STATICARP) += $(LIBLWIP_BASE)/staticarp.c|unikraft
 
 ################################################################################
 # IPv4

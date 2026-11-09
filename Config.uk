@@ -374,6 +374,27 @@ config LWIP_UKNETDEV_POLLRX
 		delivery is the pattern every proven cloud gate uses.
 		Ticket 4ecf9dcedf.
 
+config LWIP_UKNETDEV_STATICARP
+	bool "Static ARP entries for boot-declared peers"
+	depends on LWIP_UKNETDEV
+	select LIBUKLIBPARAM
+	select LWIP_NETIF_EXT_STATUS_CALLBACK
+	default n
+	help
+		Installs static ARP entries for IPv4 peers given on the
+		kernel command line as lwip.staticarp=<ipv4>, repeatable.
+		The Google Cloud fabric does not answer ARP requests for
+		instance addresses. A guest must map every peer to the
+		encoded gateway MAC 42:01:<gateway address bytes>.
+		Without these entries a reply to an inbound connection
+		waits in the ARP pending queue forever. Diagnostic run
+		ukg-1103-005311-601275 measured it: SYN-ACKs queued with
+		ARPQ used 3 of 4 and no ESTABLISHED connection. The C1
+		gate apps carry the same convention in app code (ticket
+		73b23402f0). Apps booted through app-elfloader, like
+		nginx, have no code of their own, so the library takes
+		over the job. Ticket 4ecf9dcedf.
+
 menuconfig LWIP_DEBUG
 	bool "Debug messages"
 	default n
