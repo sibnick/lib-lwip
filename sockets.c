@@ -456,8 +456,30 @@ get_lwip_socket_events(struct lwip_sock *sock)
 
 	if (sock->lastdata.pbuf || sock->rcvevent > 0)
 		events |= EPOLLIN | EPOLLRDNORM;
-	if (sock->sendevent != 0)
+
+	/*
+	 * Report EPOLLOUT from the live send-buffer state, not from the
+	 * sendevent latch. The netconn layer sets sendevent on a low-water
+	 * edge (NETCONN_EVT_SENDPLUS) and clears it only on the opposite
+	 * edge. A small write that never fills the buffer leaves sendevent
+	 * stuck at 1, so the latch reports the socket as writable forever.
+	 * For TCP, compute writability as a level instead: the socket is
+	 * writable when a write would not return EWOULDBLOCK, that is the
+	 * send buffer has room and the send queue is below the tcp_write
+	 * limit. UDP and raw sockets have no flow control, so keep the
+	 * sendevent flag for them; it stays set. [Ticket 20d68e6796]
+	 */
+	if (NETCONNTYPE_GROUP(sock->conn->type) == NETCONN_TCP) {
+		struct tcp_pcb *pcb = sock->conn->pcb.tcp;
+
+		if (pcb != NULL && tcp_sndbuf(pcb) > 0 &&
+		    tcp_sndqueuelen(pcb) <
+			    LWIP_MIN(TCP_SND_QUEUELEN,
+				     (TCP_SNDQUEUELEN_OVERFLOW + 1)))
+			events |= EPOLLOUT | EPOLLWRNORM;
+	} else if (sock->sendevent != 0) {
 		events |= EPOLLOUT | EPOLLWRNORM;
+	}
 	if (sock->errevent != 0)
 		events |= EPOLLERR;
 
