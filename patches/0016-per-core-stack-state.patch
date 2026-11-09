@@ -1,0 +1,903 @@
+--- a/src/include/lwip/priv/tcp_priv.h
++++ b/src/include/lwip/priv/tcp_priv.h
+@@ -323,6 +323,17 @@
+ #endif /* LWIP_WND_SCALE */
+ 
+ /* Global variables: */
++#if LWIP_PERCORE
++#include "lwip_percore.h"
++#define tcp_input_pcb           (lwip_get_core_state()->tcp_input_pcb)
++#define tcp_ticks               (lwip_get_core_state()->tcp_ticks)
++#define tcp_active_pcbs_changed (lwip_get_core_state()->tcp_active_pcbs_changed)
++#define tcp_bound_pcbs          (lwip_get_core_state()->tcp_bound_pcbs)
++#define tcp_listen_pcbs         (lwip_get_core_state()->tcp_listen_pcbs)
++#define tcp_active_pcbs         (lwip_get_core_state()->tcp_active_pcbs)
++#define tcp_tw_pcbs             (lwip_get_core_state()->tcp_tw_pcbs)
++#define tcp_pcb_lists           (lwip_get_core_state()->tcp_pcb_lists)
++#else /* !LWIP_PERCORE */
+ extern struct tcp_pcb *tcp_input_pcb;
+ extern u32_t tcp_ticks;
+ extern u8_t tcp_active_pcbs_changed;
+@@ -338,10 +349,13 @@
+               state in which they accept or send
+               data. */
+ extern struct tcp_pcb *tcp_tw_pcbs;      /* List of all TCP PCBs in TIME-WAIT. */
++#endif /* !LWIP_PERCORE */
+ 
+ #define NUM_TCP_PCB_LISTS_NO_TIME_WAIT  3
+ #define NUM_TCP_PCB_LISTS               4
++#if !LWIP_PERCORE
+ extern struct tcp_pcb ** const tcp_pcb_lists[NUM_TCP_PCB_LISTS];
++#endif /* !LWIP_PERCORE */
+ 
+ /* Axioms about the above lists:
+    1) Every TCP PCB that is not CLOSED is in one of the lists.
+--- a/src/core/tcp.c
++++ b/src/core/tcp.c
+@@ -156,10 +156,21 @@
+ };
+ 
+ /* last local TCP port */
++#if LWIP_PERCORE
++/* One counter per core. tcp_new_port() allocates inside the core's own
++ * slice of the range, so two cores cannot pick the same local port.
++ * Ticket 7582e2ea37. */
++#include "lwip_percore.h"
++#define tcp_port (lwip_get_core_state()->tcp_port)
++UK_CTASSERT((TCP_LOCAL_PORT_RANGE_END - TCP_LOCAL_PORT_RANGE_START) >= LWIP_CORE_MAX);
++#else
+ static u16_t tcp_port = TCP_LOCAL_PORT_RANGE_START;
++#endif
+ 
+ /* Incremented every coarse grained timer shot (typically every 500 ms). */
++#if !LWIP_PERCORE
+ u32_t tcp_ticks;
++#endif
+ static const u8_t tcp_backoff[13] =
+ { 1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7};
+ /* Times per slowtmr hits */
+@@ -167,6 +178,7 @@
+ 
+ /* The TCP PCB lists. */
+ 
++#if !LWIP_PERCORE
+ /** List of all TCP PCBs bound but not yet (connected || listening) */
+ struct tcp_pcb *tcp_bound_pcbs;
+ /** List of all TCP PCBs in LISTEN state */
+@@ -187,6 +199,10 @@
+ /** Timer counter to handle calling slow-timer from tcp_tmr() */
+ static u8_t tcp_timer;
+ static u8_t tcp_timer_ctr;
++#else /* LWIP_PERCORE */
++#define tcp_timer     (lwip_get_core_state()->tcp_timer)
++#define tcp_timer_ctr (lwip_get_core_state()->tcp_timer_ctr)
++#endif /* LWIP_PERCORE */
+ static u16_t tcp_new_port(void);
+ 
+ static err_t tcp_close_shutdown_fin(struct tcp_pcb *pcb);
+@@ -1016,10 +1032,30 @@
+   struct tcp_pcb *pcb;
+ 
+ again:
++#if LWIP_PERCORE
++  {
++    u32_t slice = (u32_t)(TCP_LOCAL_PORT_RANGE_END -
++                          TCP_LOCAL_PORT_RANGE_START) / LWIP_CORE_MAX;
++    u16_t base = (u16_t)(TCP_LOCAL_PORT_RANGE_START +
++                         lwip_current_core_id() * slice);
++    u16_t end = (u16_t)(base + slice);
++
++    /* Seed the counter once, inside this core's slice. tcp_init() may
++     * have stored a value outside the slice. */
++    if (tcp_port < base || tcp_port >= end) {
++      tcp_port = (u16_t)(base + (LWIP_RAND() % slice));
++    }
++    tcp_port++;
++    if (tcp_port >= end) {
++      tcp_port = base;
++    }
++  }
++#else
+   tcp_port++;
+   if (tcp_port == TCP_LOCAL_PORT_RANGE_END) {
+     tcp_port = TCP_LOCAL_PORT_RANGE_START;
+   }
++#endif
+   /* Check all PCB lists. */
+   for (i = 0; i < NUM_TCP_PCB_LISTS; i++) {
+     for (pcb = *tcp_pcb_lists[i]; pcb != NULL; pcb = pcb->next) {
+@@ -2222,6 +2258,21 @@
+   LWIP_ASSERT("tcp_next_iss: invalid pcb", pcb != NULL);
+   return LWIP_HOOK_TCP_ISN(&pcb->local_ip, pcb->local_port, &pcb->remote_ip, pcb->remote_port);
+ #else /* LWIP_HOOK_TCP_ISN */
++#if LWIP_PERCORE
++  u32_t *iss = &lwip_get_core_state()->tcp_iss;
++
++  LWIP_ASSERT("tcp_next_iss: invalid pcb", pcb != NULL);
++  LWIP_UNUSED_ARG(pcb);
++
++  if (*iss == 0) {
++    /* First call on this core. Each core starts at a different point in
++     * the sequence space, so two cores never share an ISS stream.
++     * Ticket 7582e2ea37. */
++    *iss = 6510u + 0x9e3779b9u * (u32_t)(lwip_current_core_id() + 1);
++  }
++  *iss += tcp_ticks;       /* XXX */
++  return *iss;
++#else
+   static u32_t iss = 6510;
+ 
+   LWIP_ASSERT("tcp_next_iss: invalid pcb", pcb != NULL);
+@@ -2229,6 +2280,7 @@
+ 
+   iss += tcp_ticks;       /* XXX */
+   return iss;
++#endif /* LWIP_PERCORE */
+ #endif /* LWIP_HOOK_TCP_ISN */
+ }
+ 
+--- a/src/core/tcp_in.c
++++ b/src/core/tcp_in.c
+@@ -85,7 +85,9 @@
+ static u8_t recv_flags;
+ static struct pbuf *recv_data;
+ 
++#if !LWIP_PERCORE
+ struct tcp_pcb *tcp_input_pcb;
++#endif
+ 
+ /* Forward declarations. */
+ static err_t tcp_process(struct tcp_pcb *pcb);
+--- a/src/core/timeouts.c
++++ b/src/core/timeouts.c
+@@ -119,21 +119,34 @@
+ #if LWIP_TIMERS && !LWIP_TIMERS_CUSTOM
+ 
+ /** The one and only timeout list */
++#if LWIP_PERCORE
++#include "lwip_percore.h"
++#define next_timeout             (lwip_get_core_state()->next_timeout)
++#define current_timeout_due_time (lwip_get_core_state()->current_timeout_due_time)
++#define tcpip_tcp_timer_active   (lwip_get_core_state()->tcpip_tcp_timer_active)
++#else
+ static struct sys_timeo *next_timeout;
+ 
+ static u32_t current_timeout_due_time;
++#endif
+ 
+ #if LWIP_TESTMODE
+ struct sys_timeo**
+ sys_timeouts_get_next_timeout(void)
+ {
++#if LWIP_PERCORE
++  return &lwip_get_core_state()->next_timeout;
++#else
+   return &next_timeout;
++#endif
+ }
+ #endif
+ 
+ #if LWIP_TCP
+ /** global variable that shows if the tcp timer is currently scheduled or not */
++#if !LWIP_PERCORE
+ static int tcpip_tcp_timer_active;
++#endif
+ 
+ /**
+  * Timer callback function that calls tcp_tmr() and reschedules itself.
+--- a/src/core/ipv4/etharp.c
++++ b/src/core/ipv4/etharp.c
+@@ -87,6 +87,11 @@
+ #endif /* ETHARP_SUPPORT_STATIC_ENTRIES */
+ };
+ 
++#if LWIP_PERCORE
++#include "lwip_percore.h"
++#define arp_table           (lwip_get_core_state()->arp_table)
++#define etharp_cached_entry (lwip_get_core_state()->etharp_cached_entry)
++#else
+ struct etharp_entry {
+ #if ARP_QUEUEING
+   /** Pointer to queue of pending outgoing packets on this ARP entry. */
+@@ -107,6 +112,7 @@
+ #if !LWIP_NETIF_HWADDRHINT
+ static netif_addr_idx_t etharp_cached_entry;
+ #endif /* !LWIP_NETIF_HWADDRHINT */
++#endif
+ 
+ /** Try hard to create a new entry - we want the IP address to appear in
+     the cache (even if this means removing an active entry or so). */
+--- a/src/core/memp.c
++++ b/src/core/memp.c
+@@ -75,6 +75,52 @@
+ #include "lwip/ip6_frag.h"
+ #include "lwip/mld6.h"
+ 
++#if LWIP_PERCORE
++#include "lwip_percore.h"
++#include <uk/arch/spinlock.h>
++
++/* cs->memp_tabs has one slot per pool type. A larger MEMP_MAX would
++   write past the array. Fail at compile time. Ticket de29b056ef. */
++UK_CTASSERT(MEMP_MAX <= LWIP_MEMP_MAX);
++
++/* Shared reserve per pool, guarded by a per-pool spinlock. A core
++   with an empty private list takes from here. Pools smaller than the
++   core count live here entirely, so no core starts with zero
++   elements. Ticket de29b056ef. */
++static struct memp *memp_shared[MEMP_MAX];
++static __spinlock memp_shared_lock[MEMP_MAX] = {
++  [0 ... MEMP_MAX - 1] = UKARCH_SPINLOCK_INITIALIZER()
++};
++static u8_t memp_shared_only[MEMP_MAX];
++
++/* Return the pool index, or MEMP_MAX when the desc is not a known
++   pool. The old code returned 0 then, so a lookup miss silently used
++   the wrong pool. Ticket de29b056ef. */
++static inline memp_t memp_get_pool_type(const struct memp_desc *desc)
++{
++  memp_t i;
++  for (i = 0; i < MEMP_MAX; i++) {
++    if (memp_pools[i] == desc)
++      return i;
++  }
++  return MEMP_MAX;
++}
++
++/* Pop one element from the shared reserve of one pool. */
++static struct memp *
++memp_shared_take(memp_t type)
++{
++  struct memp *m;
++  ukarch_spin_lock(&memp_shared_lock[type]);
++  m = memp_shared[type];
++  if (m != NULL) {
++    memp_shared[type] = m->next;
++  }
++  ukarch_spin_unlock(&memp_shared_lock[type]);
++  return m;
++}
++#endif
++
+ #define LWIP_MEMPOOL(name,num,size,desc) LWIP_MEMPOOL_DECLARE(name,num,size,desc)
+ #include "lwip/priv/memp_std.h"
+ 
+@@ -177,6 +223,62 @@
+ #if MEMP_MEM_MALLOC
+   LWIP_UNUSED_ARG(desc);
+ #else
++#if LWIP_PERCORE
++  int i, c;
++  memp_t type = memp_get_pool_type(desc);
++  u8_t *curr = (u8_t *)LWIP_MEM_ALIGN(desc->base);
++  u16_t total = desc->num;
++  u16_t elem_size = (u16_t)(MEMP_SIZE + desc->size
++#if MEMP_OVERFLOW_CHECK
++                            + MEM_SANITY_REGION_AFTER_ALIGNED
++#endif
++                           );
++  u16_t count_per_core;
++  u16_t rem;
++
++  /* A desc outside memp_pools is a caller bug. Stop with a clear
++     message instead of writing to slot 0. Ticket de29b056ef. */
++  UK_ASSERT(type < MEMP_MAX);
++  if (unlikely(type >= MEMP_MAX)) {
++    LWIP_DEBUGF(MEMP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("memp_init_pool: unknown pool %s\n", desc->desc));
++    return;
++  }
++
++  /* A pool with fewer elements than cores cannot give every core a
++     private element. Put the whole pool into the shared reserve for
++     that case. Otherwise split evenly and keep the remainder in the
++     reserve, so no element is lost. Ticket de29b056ef. */
++  memp_shared_only[type] = (total < LWIP_CORE_MAX) ? 1 : 0;
++  count_per_core = memp_shared_only[type] ? 0 : (u16_t)(total / LWIP_CORE_MAX);
++  rem = (u16_t)(total - count_per_core * LWIP_CORE_MAX);
++
++  memp_shared[type] = NULL;
++
++  for (c = 0; c < LWIP_CORE_MAX; c++) {
++    struct lwip_core_state *cs = lwip_get_core_state_by_id(c);
++    cs->memp_tabs[type] = NULL;
++    for (i = 0; i < count_per_core; ++i) {
++      struct memp *m = (struct memp *)(void *)curr;
++      m->next = cs->memp_tabs[type];
++      cs->memp_tabs[type] = m;
++#if MEMP_OVERFLOW_CHECK
++      memp_overflow_init_element(m, desc);
++#endif
++      curr += elem_size;
++    }
++  }
++  /* Elements the even split did not place go to the shared
++     reserve. */
++  for (i = 0; i < rem; ++i) {
++    struct memp *m = (struct memp *)(void *)curr;
++    m->next = memp_shared[type];
++    memp_shared[type] = m;
++#if MEMP_OVERFLOW_CHECK
++    memp_overflow_init_element(m, desc);
++#endif
++    curr += elem_size;
++  }
++#else
+   int i;
+   struct memp *memp;
+ 
+@@ -204,6 +306,7 @@
+ #endif
+                                   );
+   }
++#endif
+ #if MEMP_STATS
+   desc->stats->avail = desc->num;
+ #endif /* MEMP_STATS */
+@@ -250,7 +353,28 @@
+   struct memp *memp;
+   SYS_ARCH_DECL_PROTECT(old_level);
+ 
+-#if MEMP_MEM_MALLOC
++#if LWIP_PERCORE
++  memp_t type = memp_get_pool_type(desc);
++  struct lwip_core_state *cs;
++
++  /* Same guard as memp_init_pool: never touch slot 0 of the wrong
++     pool. Ticket de29b056ef. */
++  UK_ASSERT(type < MEMP_MAX);
++  if (unlikely(type >= MEMP_MAX)) {
++    LWIP_DEBUGF(MEMP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("memp_malloc: unknown pool %s\n", desc->desc));
++    return NULL;
++  }
++  cs = lwip_get_core_state();
++  SYS_ARCH_PROTECT(old_level);
++  memp = cs->memp_tabs[type];
++  if (memp != NULL) {
++    cs->memp_tabs[type] = memp->next;
++  } else {
++    /* Private list empty: take from the shared reserve before
++       reporting an error. Ticket de29b056ef. */
++    memp = memp_shared_take(type);
++  }
++#elif MEMP_MEM_MALLOC
+   memp = (struct memp *)mem_malloc(MEMP_SIZE + MEMP_ALIGN_SIZE(desc->size));
+   SYS_ARCH_PROTECT(old_level);
+ #else /* MEMP_MEM_MALLOC */
+@@ -265,7 +389,10 @@
+     memp_overflow_check_element(memp, desc);
+ #endif /* MEMP_OVERFLOW_CHECK */
+ 
++#if !LWIP_PERCORE
++    /* The per-core path already popped the element above. */
+     *desc->tab = memp->next;
++#endif
+ #if MEMP_OVERFLOW_CHECK
+     memp->next = NULL;
+ #endif /* MEMP_OVERFLOW_CHECK */
+@@ -382,8 +509,34 @@
+   SYS_ARCH_UNPROTECT(old_level);
+   mem_free(memp);
+ #else /* MEMP_MEM_MALLOC */
++#if LWIP_PERCORE
++  memp_t type = memp_get_pool_type(desc);
++
++  /* Same guard as memp_init_pool. Ticket de29b056ef. */
++  UK_ASSERT(type < MEMP_MAX);
++  if (unlikely(type >= MEMP_MAX)) {
++    SYS_ARCH_UNPROTECT(old_level);
++    LWIP_DEBUGF(MEMP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("memp_free: unknown pool %s\n", desc->desc));
++    return;
++  }
++  if (memp_shared_only[type]) {
++    /* Whole pool is shared: return the element to the shared
++       reserve so every core can reach it again. Ticket de29b056ef. */
++    ukarch_spin_lock(&memp_shared_lock[type]);
++    memp->next = memp_shared[type];
++    memp_shared[type] = memp;
++    ukarch_spin_unlock(&memp_shared_lock[type]);
++  } else {
++    /* Elements from the shared reserve join the private list of the
++       freeing core. The pool total is conserved. */
++    struct lwip_core_state *cs = lwip_get_core_state();
++    memp->next = cs->memp_tabs[type];
++    cs->memp_tabs[type] = memp;
++  }
++#else
+   memp->next = *desc->tab;
+   *desc->tab = memp;
++#endif
+ 
+ #if MEMP_SANITY_CHECK
+   LWIP_ASSERT("memp sanity", memp_sanity(desc));
+--- a/src/api/sockets.c
++++ b/src/api/sockets.c
+@@ -262,7 +262,13 @@
+ #endif /* LWIP_IPV6_MLD */
+ 
+ /** The global array of available sockets */
++#if LWIP_PERCORE
++#include "lwip_percore.h"
++#define select_cb_list (lwip_get_core_state()->select_cb_list)
++#define select_cb_ctr  (lwip_get_core_state()->select_cb_ctr)
++#else
+ static struct lwip_sock sockets[NUM_SOCKETS];
++#endif
+ 
+ #if LWIP_SOCKET_SELECT || LWIP_SOCKET_POLL
+ #if LWIP_TCPIP_CORE_LOCKING
+@@ -277,10 +283,14 @@
+ #define LWIP_SOCKET_SELECT_UNPROTECT(lev)     SYS_ARCH_UNPROTECT(lev)
+ /** This counter is increased from lwip_select when the list is changed
+     and checked in select_check_waiters to see if it has changed. */
++#if !LWIP_PERCORE
+ static volatile int select_cb_ctr;
++#endif
+ #endif /* LWIP_TCPIP_CORE_LOCKING */
+ /** The global list of tasks waiting for select */
++#if !LWIP_PERCORE
+ static struct lwip_select_cb *select_cb_list;
++#endif
+ #endif /* LWIP_SOCKET_SELECT || LWIP_SOCKET_POLL */
+ 
+ #define sock_set_errno(sk, e) do { \
+@@ -379,6 +389,21 @@
+  * (e.g. read-while-write or close-while-write, etc)
+  * This function is called at the end of functions using (try)get_socket*().
+  */
++#if LWIP_PERCORE
++static inline int
++lwip_sock_to_core(const struct lwip_sock *sock)
++{
++  unsigned int c;
++  for (c = 0; c < LWIP_CORE_MAX; c++) {
++    if (sock >= &uk_lwip_core_states[c].sockets[0] &&
++        sock < &uk_lwip_core_states[c].sockets[NUM_SOCKETS]) {
++      return (int)c;
++    }
++  }
++  return -1;
++}
++#endif
++
+ static void
+ done_socket(struct lwip_sock *sock)
+ {
+@@ -402,7 +427,19 @@
+   SYS_ARCH_UNPROTECT(lev);
+ 
+   if (freed) {
++#if LWIP_PERCORE
++    int owner_core = lwip_sock_to_core(sock);
++    unsigned int cur_core = lwip_current_core_id();
++    if (owner_core >= 0 && (unsigned int)owner_core != cur_core && cur_core < LWIP_CORE_MAX) {
++      lwip_core_override[cur_core] = lwip_get_core_state_by_id((unsigned int)owner_core);
++    }
++#endif
+     free_socket_free_elements(is_tcp, conn, &lastdata);
++#if LWIP_PERCORE
++    if (cur_core < LWIP_CORE_MAX) {
++      lwip_core_override[cur_core] = NULL;
++    }
++#endif
+   }
+ }
+ 
+@@ -417,11 +454,34 @@
+ tryget_socket_unconn_nouse(int fd)
+ {
+   int s = fd - LWIP_SOCKET_OFFSET;
+-  if ((s < 0) || (s >= NUM_SOCKETS)) {
++  if (s < 0) {
++    return NULL;
++  }
++#if LWIP_PERCORE
++  int core = s / NUM_SOCKETS;
++  int idx = s % NUM_SOCKETS;
++  if (core >= LWIP_CORE_MAX || idx >= NUM_SOCKETS) {
++    LWIP_DEBUGF(SOCKETS_DEBUG, ("tryget_socket_unconn(%d): invalid\n", fd));
++    return NULL;
++  }
++  if (core != (int)lwip_current_core_id()) {
++    /* This fd belongs to another core. Every stack call that follows
++     * this lookup uses the per-core state of the calling core: the pcb
++     * lists, the memp pools, the select list. Running it on the owner's
++     * socket would corrupt the owner's lists. Fail with EBADF instead.
++     * Ticket c07f809ed7. */
++    LWIP_DEBUGF(SOCKETS_DEBUG, ("tryget_socket_unconn(%d): wrong core\n", fd));
++    set_errno(EBADF);
++    return NULL;
++  }
++  return &lwip_get_core_state_by_id(core)->sockets[idx];
++#else
++  if (s >= NUM_SOCKETS) {
+     LWIP_DEBUGF(SOCKETS_DEBUG, ("tryget_socket_unconn(%d): invalid\n", fd));
+     return NULL;
+   }
+   return &sockets[s];
++#endif
+ }
+ 
+ struct lwip_sock *
+@@ -475,6 +535,36 @@
+   return NULL;
+ }
+ 
++#if LWIP_PERCORE
++/* Direct per-core socket access by core ID without caller core check */
++static struct lwip_sock *
++tryget_socket_core(int fd)
++{
++  int s = fd - LWIP_SOCKET_OFFSET;
++  if (s < 0) {
++    return NULL;
++  }
++  int core = s / NUM_SOCKETS;
++  int idx = s % NUM_SOCKETS;
++  if (core >= LWIP_CORE_MAX || idx >= NUM_SOCKETS) {
++    return NULL;
++  }
++  struct lwip_core_state *cs = lwip_get_core_state_by_id((unsigned int)core);
++  if (!cs) {
++    return NULL;
++  }
++  struct lwip_sock *sock = &cs->sockets[idx];
++  if (!sock_inc_used(sock)) {
++    return NULL;
++  }
++  if (!sock->conn) {
++    done_socket(sock);
++    return NULL;
++  }
++  return sock;
++}
++#endif
++
+ /**
+  * Map a externally used socket index to the internal socket representation.
+  *
+@@ -486,7 +576,11 @@
+ {
+   struct lwip_sock *sock = tryget_socket(fd);
+   if (!sock) {
++#if LWIP_PERCORE
++    if ((fd < LWIP_SOCKET_OFFSET) || (fd >= (LWIP_SOCKET_OFFSET + NUM_SOCKETS * LWIP_CORE_MAX))) {
++#else
+     if ((fd < LWIP_SOCKET_OFFSET) || (fd >= (LWIP_SOCKET_OFFSET + NUM_SOCKETS))) {
++#endif
+       LWIP_DEBUGF(SOCKETS_DEBUG, ("get_socket(%d): invalid\n", fd));
+     }
+     set_errno(EBADF);
+@@ -510,6 +604,37 @@
+   SYS_ARCH_DECL_PROTECT(lev);
+   LWIP_UNUSED_ARG(accepted);
+ 
++#if LWIP_PERCORE
++  struct lwip_core_state *cs = lwip_get_core_state();
++  unsigned int core = lwip_current_core_id();
++
++  for (i = 0; i < NUM_SOCKETS; ++i) {
++    SYS_ARCH_PROTECT(lev);
++    if (!cs->sockets[i].conn) {
++#if LWIP_NETCONN_FULLDUPLEX
++      if (cs->sockets[i].fd_used) {
++        SYS_ARCH_UNPROTECT(lev);
++        continue;
++      }
++      cs->sockets[i].fd_used    = 1;
++      cs->sockets[i].fd_free_pending = 0;
++#endif
++      cs->sockets[i].conn       = newconn;
++      SYS_ARCH_UNPROTECT(lev);
++      cs->sockets[i].lastdata.pbuf = NULL;
++#if LWIP_SOCKET_SELECT || LWIP_SOCKET_POLL
++      LWIP_ASSERT("cs->sockets[i].select_waiting == 0", cs->sockets[i].select_waiting == 0);
++      cs->sockets[i].rcvevent   = 0;
++      cs->sockets[i].sendevent  = (NETCONNTYPE_GROUP(newconn->type) == NETCONN_TCP ? (accepted != 0) : 1);
++      cs->sockets[i].errevent   = 0;
++      cs->sockets[i].sock_data  = NULL;
++#endif
++      return i + core * NUM_SOCKETS + LWIP_SOCKET_OFFSET;
++    }
++    SYS_ARCH_UNPROTECT(lev);
++  }
++  return -1;
++#else /* !LWIP_PERCORE */
+   /* allocate a new socket identifier */
+   for (i = 0; i < NUM_SOCKETS; ++i) {
+     /* Protect socket array */
+@@ -542,6 +667,7 @@
+     SYS_ARCH_UNPROTECT(lev);
+   }
+   return -1;
++#endif /* !LWIP_PERCORE */
+ }
+ 
+ /** Free a socket (under lock)
+@@ -664,8 +790,13 @@
+     done_socket(sock);
+     return -1;
+   }
++#if LWIP_PERCORE
++  LWIP_ASSERT("invalid socket index", (newsock >= LWIP_SOCKET_OFFSET) && (newsock < NUM_SOCKETS * LWIP_CORE_MAX + LWIP_SOCKET_OFFSET));
++  nsock = tryget_socket_unconn_nouse(newsock);
++#else
+   LWIP_ASSERT("invalid socket index", (newsock >= LWIP_SOCKET_OFFSET) && (newsock < NUM_SOCKETS + LWIP_SOCKET_OFFSET));
+   nsock = &sockets[newsock - LWIP_SOCKET_OFFSET];
++#endif
+ 
+   /* See event_callback: If data comes in right away after an accept, even
+    * though the server task might not have created a new socket yet.
+@@ -780,14 +911,29 @@
+   struct lwip_sock *sock;
+   int is_tcp = 0;
+   err_t err;
++#if LWIP_PERCORE
++  int core = (s >= LWIP_SOCKET_OFFSET) ? (s - LWIP_SOCKET_OFFSET) / NUM_SOCKETS : -1;
++  unsigned int cur_core = lwip_current_core_id();
++#endif
+ 
+   LWIP_DEBUGF(SOCKETS_DEBUG, ("lwip_close(%d)\n", s));
+ 
++#if LWIP_PERCORE
++  sock = tryget_socket_core(s);
++#else
+   sock = get_socket(s);
++#endif
+   if (!sock) {
++    set_errno(EBADF);
+     return -1;
+   }
+ 
++#if LWIP_PERCORE
++  if (core >= 0 && core < LWIP_CORE_MAX && (unsigned int)core != cur_core && cur_core < LWIP_CORE_MAX) {
++    lwip_core_override[cur_core] = lwip_get_core_state_by_id((unsigned int)core);
++  }
++#endif
++
+   if (sock->conn != NULL) {
+     is_tcp = NETCONNTYPE_GROUP(netconn_type(sock->conn)) == NETCONN_TCP;
+   } else {
+@@ -807,10 +953,20 @@
+   if (err != ERR_OK) {
+     sock_set_errno(sock, err_to_errno(err));
+     done_socket(sock);
++#if LWIP_PERCORE
++    if (cur_core < LWIP_CORE_MAX) {
++      lwip_core_override[cur_core] = NULL;
++    }
++#endif
+     return -1;
+   }
+ 
+   free_socket(sock, is_tcp);
++#if LWIP_PERCORE
++  if (cur_core < LWIP_CORE_MAX) {
++    lwip_core_override[cur_core] = NULL;
++  }
++#endif
+   set_errno(0);
+   return 0;
+ }
+@@ -1742,7 +1898,11 @@
+     return -1;
+   }
+   conn->socket = i;
++#if LWIP_PERCORE
++  done_socket(tryget_socket_unconn_nouse(i));
++#else
+   done_socket(&sockets[i - LWIP_SOCKET_OFFSET]);
++#endif
+   LWIP_DEBUGF(SOCKETS_DEBUG, ("%d\n", i));
+   set_errno(0);
+   return i;
+@@ -2518,7 +2678,11 @@
+       SYS_ARCH_UNPROTECT(lev);
+     }
+ 
++#if LWIP_PERCORE
++    sock = tryget_socket_core(s);
++#else
+     sock = get_socket(s);
++#endif
+     if (!sock) {
+       return;
+     }
+@@ -2595,6 +2759,15 @@
+   int last_select_cb_ctr;
+   SYS_ARCH_DECL_PROTECT(lev);
+ #endif /* !LWIP_TCPIP_CORE_LOCKING */
++#if LWIP_PERCORE
++  int core = (s >= LWIP_SOCKET_OFFSET) ? (s - LWIP_SOCKET_OFFSET) / NUM_SOCKETS : -1;
++  unsigned int cur_core = lwip_current_core_id();
++  int overridden = 0;
++  if (core >= 0 && core < LWIP_CORE_MAX && (unsigned int)core != cur_core && cur_core < LWIP_CORE_MAX) {
++    lwip_core_override[cur_core] = lwip_get_core_state_by_id((unsigned int)core);
++    overridden = 1;
++  }
++#endif
+ 
+   LWIP_ASSERT_CORE_LOCKED();
+ 
+@@ -2660,6 +2833,11 @@
+   }
+   SYS_ARCH_UNPROTECT(lev);
+ #endif
++#if LWIP_PERCORE
++  if (overridden && cur_core < LWIP_CORE_MAX) {
++    lwip_core_override[cur_core] = NULL;
++  }
++#endif
+ }
+ #endif /* LWIP_SOCKET_SELECT || LWIP_SOCKET_POLL */
+ 
+@@ -2883,6 +3061,9 @@
+   case SO_KEEPALIVE:
+     return SOF_KEEPALIVE;
+   case SO_REUSEADDR:
++#ifdef SO_REUSEPORT
++  case SO_REUSEPORT:
++#endif
+     return SOF_REUSEADDR;
+   default:
+     LWIP_ASSERT("Unknown socket option", 0);
+@@ -2934,6 +3115,9 @@
+         case SO_KEEPALIVE:
+ #if SO_REUSE
+         case SO_REUSEADDR:
++#ifdef SO_REUSEPORT
++        case SO_REUSEPORT:
++#endif
+ #endif /* SO_REUSE */
+           if ((optname == SO_BROADCAST) &&
+               (NETCONNTYPE_GROUP(sock->conn->type) != NETCONN_UDP)) {
+@@ -3342,6 +3526,9 @@
+         case SO_KEEPALIVE:
+ #if SO_REUSE
+         case SO_REUSEADDR:
++#ifdef SO_REUSEPORT
++        case SO_REUSEPORT:
++#endif
+ #endif /* SO_REUSE */
+           if ((optname == SO_BROADCAST) &&
+               (NETCONNTYPE_GROUP(sock->conn->type) != NETCONN_UDP)) {
+--- a/src/core/udp.c
++++ b/src/core/udp.c
+@@ -74,11 +74,22 @@
+ #endif
+ 
+ /* last local UDP port */
++#if LWIP_PERCORE
++/* One counter and one pcb list base per core. udp_new_port() allocates
++ * inside the core's own slice of the range. The list base is private
++ * because every walker on this port is a same-core caller: udp_input,
++ * udp_connect/udp_bind/udp_disconnect, the per-core timers, and the
++ * per-core memp and mem stats. Ticket 7582e2ea37. */
++#include "lwip_percore.h"
++#define udp_port  (lwip_get_core_state()->udp_port)
++#define udp_pcbs  (lwip_get_core_state()->udp_pcbs)
++#else
+ static u16_t udp_port = UDP_LOCAL_PORT_RANGE_START;
+ 
+ /* The list of UDP PCBs */
+ /* exported in udp.h (was static) */
+ struct udp_pcb *udp_pcbs;
++#endif
+ 
+ /**
+  * Initialize this module.
+@@ -103,9 +114,29 @@
+   struct udp_pcb *pcb;
+ 
+ again:
++#if LWIP_PERCORE
++  {
++    u32_t slice = (u32_t)(UDP_LOCAL_PORT_RANGE_END -
++                          UDP_LOCAL_PORT_RANGE_START) / LWIP_CORE_MAX;
++    u16_t base = (u16_t)(UDP_LOCAL_PORT_RANGE_START +
++                         lwip_current_core_id() * slice);
++    u16_t end = (u16_t)(base + slice);
++
++    /* Seed the counter once, inside this core's slice. udp_init() may
++     * have stored a value outside the slice. */
++    if (udp_port < base || udp_port >= end) {
++      udp_port = (u16_t)(base + (LWIP_RAND() % slice));
++    }
++    udp_port++;
++    if (udp_port >= end) {
++      udp_port = base;
++    }
++  }
++#else
+   if (udp_port++ == UDP_LOCAL_PORT_RANGE_END) {
+     udp_port = UDP_LOCAL_PORT_RANGE_START;
+   }
++#endif
+   /* Check all PCBs. */
+   for (pcb = udp_pcbs; pcb != NULL; pcb = pcb->next) {
+     if (pcb->local_port == udp_port) {
+--- a/src/core/raw.c
++++ b/src/core/raw.c
+@@ -63,7 +63,16 @@
+ #include <string.h>
+ 
+ /** The list of RAW PCBs */
++#if LWIP_PERCORE
++/* Per-core list base. Every walker in raw.c is a same-core caller:
++ * raw_input, raw_new/bind/connect/disconnect, and raw_remove. The raw
++ * module has no port allocator, so it needs no port slice.
++ * Ticket 7582e2ea37. */
++#include "lwip_percore.h"
++#define raw_pcbs  (lwip_get_core_state()->raw_pcbs)
++#else
+ static struct raw_pcb *raw_pcbs;
++#endif
+ 
+ static u8_t
+ raw_input_local_match(struct raw_pcb *pcb, u8_t broadcast)
+--- a/src/core/netif.c
++++ b/src/core/netif.c
+@@ -74,6 +74,28 @@
+ 
+ #include "netif/ethernet.h"
+ 
++#if LWIP_PERCORE
++/*
++ * The netif list is global to all cores. This port keeps it that way on
++ * purpose. Management code owns it. The app adds and removes netifs on
++ * the boot core before starting worker cores. The periodic etharp timer
++ * runs on core 0 only. The three mutators below assert that contract.
++ * Release builds must also enforce this check because worker cores read
++ * the global netif list with no lock. [Tickets 7582e2ea37, 2fc4e3e0be]
++ */
++#include <uk/crash.h>
++#include "lwip_percore.h"
++#define NETIF_BOOTSIDE_ASSERT() \
++	do { \
++		if (unlikely(lwip_current_core_id() != 0)) { \
++			UK_CRASH("lwip: netif mutation on non-boot core %u\n", \
++				 lwip_current_core_id()); \
++		} \
++	} while (0)
++#else /* !LWIP_PERCORE */
++#define NETIF_BOOTSIDE_ASSERT()
++#endif /* !LWIP_PERCORE */
++
+ #if LWIP_AUTOIP
+ #include "lwip/autoip.h"
+ #endif /* LWIP_AUTOIP */
+@@ -284,6 +306,7 @@
+ #endif
+ 
+   LWIP_ASSERT_CORE_LOCKED();
++  NETIF_BOOTSIDE_ASSERT();
+ 
+ #if LWIP_SINGLE_NETIF
+   if (netif_default != NULL) {
+@@ -744,6 +767,7 @@
+ #endif
+ 
+   LWIP_ASSERT_CORE_LOCKED();
++  NETIF_BOOTSIDE_ASSERT();
+ 
+   if (netif == NULL) {
+     return;
+@@ -825,6 +849,7 @@
+ netif_set_default(struct netif *netif)
+ {
+   LWIP_ASSERT_CORE_LOCKED();
++  NETIF_BOOTSIDE_ASSERT();
+ 
+   if (netif == NULL) {
+     /* remove default route */
+--- a/src/include/lwip/udp.h
++++ b/src/include/lwip/udp.h
+@@ -112,7 +112,9 @@
+   void *recv_arg;
+ };
+ /* udp_pcbs export for external reference (e.g. SNMP agent) */
++#if !LWIP_PERCORE
+ extern struct udp_pcb *udp_pcbs;
++#endif
+ 
+ /* The following functions is the application layer interface to the
+    UDP code. */
