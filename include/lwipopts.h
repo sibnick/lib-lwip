@@ -62,7 +62,23 @@ void sys_free(void *ptr);
  */
 #if CONFIG_LWIP_NOTHREADS
 #define NO_SYS 1
+/* Enable per-core state only when the Kconfig option is set */
+#if CONFIG_LWIP_PERCORE
+#define LWIP_PERCORE 1
+#endif
+/* Single-threaded: there is no inter-task contention to protect */
+#define SYS_LIGHTWEIGHT_PROT 0
+#define LWIP_TCPIP_CORE_LOCKING 0
 #define LWIP_NETIF_LOOPBACK_MULTITHREADING 0
+/*
+ * Mailbox sizes for the sequential (netconn) API in mainloop mode.
+ * The recvmbox sizes must cover a full receive window of pending
+ * segments, the acceptmbox must cover the listen backlog.
+ */
+#define TCPIP_MBOX_SIZE 128
+#define DEFAULT_UDP_RECVMBOX_SIZE 64
+#define DEFAULT_TCP_RECVMBOX_SIZE 256
+#define DEFAULT_ACCEPTMBOX_SIZE 1024
 #else  /* CONFIG_LWIP_NOTHREADS */
 #define NO_SYS 0
 #define LWIP_NETIF_LOOPBACK_MULTITHREADING 1
@@ -201,7 +217,14 @@ void sys_free(void *ptr);
 #define TCP_SNDLOWAT (4 * TCP_MSS)
 #define TCP_SND_QUEUELEN (2 * (TCP_SND_BUF) / (TCP_MSS))
 #define TCP_QUEUE_OOSEQ 4
-#define MEMP_NUM_TCP_SEG ((MEMP_NUM_TCP_PCB) * ((TCP_SND_QUEUELEN) / 5))
+/*
+ * MEMP_NUM_TCP_SEG sizes the pool of struct tcp_seg. struct memp_desc.num
+ * is u16_t, so any count above 65535 overflows and silently truncates.
+ * Cap the count at 65535 with a plain ternary for preprocessor evaluation.
+ * [Ticket 150d621866]
+ */
+#define MEMP_NUM_TCP_SEG ((((MEMP_NUM_TCP_PCB) * ((TCP_SND_QUEUELEN) / 5)) > 65535) ? \
+	65535 : ((MEMP_NUM_TCP_PCB) * ((TCP_SND_QUEUELEN) / 5)))
 #define MEMP_NUM_FRAG_PBUF 32
 
 #endif /* LWIP_TCP */
@@ -253,6 +276,9 @@ void sys_free(void *ptr);
 
 /* enable SO_REUSEADDR option */
 #define SO_REUSE 1
+#ifndef SO_REUSEPORT
+#define SO_REUSEPORT 15
+#endif
 #endif /* LWIP_SOCKET */
 
 /**
@@ -289,17 +315,32 @@ void sys_free(void *ptr);
  * this at the very last point in this configuration file.
  */
 #ifndef PBUF_POOL_SIZE
-#include <uk/essentials.h> /* MAX */
-#define PBUF_POOL_SIZE MAX(((TCP_WND + TCP_MSS - 1) / TCP_MSS), 2 * IP_REASS_MAX_PBUFS)
+/*
+ * Plain ternary, not uk/essentials.h MAX. The core checks this
+ * value in #if directives, and a statement-expression macro cannot
+ * be evaluated by the preprocessor. The operands are integer
+ * constants, so the ternary is preprocessor-evaluable.
+ */
+#define PBUF_POOL_SIZE ((((TCP_WND + TCP_MSS - 1) / TCP_MSS) > (2 * IP_REASS_MAX_PBUFS)) ? ((TCP_WND + TCP_MSS - 1) / TCP_MSS) : (2 * IP_REASS_MAX_PBUFS))
 #endif
 #ifndef PBUF_POOL_BUFSIZE
 /* smallest PBUF_POOL_BUFSIZE which satisfies TCP_WND < PBUF_POOL_SIZE * (PBUF_POOL_BUFSIZE - protocol headers) */
 #define PBUF_POOL_BUFSIZE ((TCP_WND / PBUF_POOL_SIZE) + (PBUF_LINK_ENCAPSULATION_HLEN + PBUF_LINK_HLEN + PBUF_IP_HLEN + PBUF_TRANSPORT_HLEN) + 1)
 #endif
 #ifndef MEMP_NUM_PBUF
-#define MEMP_NUM_PBUF ((MEMP_NUM_TCP_PCB * (TCP_SND_QUEUELEN)) / 2)
+/*
+ * MEMP_NUM_PBUF sizes the pool of ROM and REF pbufs. struct memp_desc.num
+ * is u16_t, so any count above 65535 overflows and silently truncates.
+ * Cap the count at 65535 with a plain ternary for preprocessor evaluation.
+ * [Ticket 150d621866]
+ */
+#define MEMP_NUM_PBUF (((((MEMP_NUM_TCP_PCB) * (TCP_SND_QUEUELEN)) / 2) > 65535) ? \
+	65535 : (((MEMP_NUM_TCP_PCB) * (TCP_SND_QUEUELEN)) / 2))
 #endif
+#if CONFIG_LWIP_THREADS
+/* The input message pool is only used by the threaded stack input queue */
 #define MEMP_NUM_TCPIP_MSG_INPKT TCPIP_MBOX_SIZE
+#endif /* CONFIG_LWIP_THREADS */
 #endif /* MEM_USE_POOLS */
 
 /**
@@ -329,9 +370,12 @@ void sys_free(void *ptr);
 #define LWIP_DHCP 0
 #endif
 
-#if CONFIG_LWIP_NOTHREADS
-#define LWIP_NETCONN 0
-#else
+/*
+ * The netconn API is the foundation of the Socket API. In threaded
+ * mode it is always available. In mainloop mode it is driven directly
+ * from the application context and is only needed by the Socket API.
+ */
+#if !CONFIG_LWIP_NOTHREADS || CONFIG_LWIP_SOCKET
 #define LWIP_NETCONN 1
 /* maximum number of struct netconn entries, which limits the maximum
  * number of open sockets */
@@ -340,6 +384,18 @@ void sys_free(void *ptr);
 #else
 #define MEMP_NUM_NETCONN 64
 #endif /* LWIP_TCP */
+/*
+ * Number of struct netbuf entries. The sequential API allocates one
+ * netbuf per received datagram. The netbuf stays allocated until the
+ * application reads the datagram with recv(). The lwIP default of 2 is
+ * too small: when the socket mailbox holds one netbuf and recv() is
+ * copying another, the next received datagram cannot allocate a netbuf
+ * and lwIP drops it without an error. Keep the count aligned with
+ * MEMP_NUM_NETCONN.
+ */
+#define MEMP_NUM_NETBUF 64
+#else
+#define LWIP_NETCONN 0
 #endif
 
 /**

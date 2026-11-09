@@ -483,6 +483,32 @@ lwip_posix_socket_event_callback(struct lwip_sock *sock,
 	posix_sock_event_assign(sockobj, events);
 }
 
+#if CONFIG_LIBPOSIX_SOCKET_POLLED
+/*
+ * On-demand event level for polled socket queues. The caller re-polls
+ * the live lwIP socket state, so the queue itself does not store
+ * levels: this callback is the single source of truth.
+ */
+static unsigned int
+lwip_posix_socket_poll(posix_sock *file, unsigned int mask)
+{
+	int lwip_fd;
+	unsigned int revents;
+	struct lwip_sock *sock;
+
+	lwip_fd = _lwip_getfd(file);
+	if (unlikely(lwip_fd < 0))
+		return 0;
+
+	sock = lwip_socket_dbg_get_socket(lwip_fd);
+	if (unlikely(!sock || !sock->conn))
+		return 0;
+
+	revents = get_lwip_socket_events(sock);
+	return revents & mask;
+}
+#endif /* CONFIG_LIBPOSIX_SOCKET_POLLED */
+
 static void
 lwip_posix_socket_poll_setup(posix_sock *file)
 {
@@ -529,6 +555,9 @@ static struct posix_socket_ops lwip_posix_socket_ops = {
 	.write		= lwip_posix_socket_write,
 	.close		= lwip_posix_socket_close,
 	.ioctl		= lwip_posix_socket_ioctl,
+#if CONFIG_LIBPOSIX_SOCKET_POLLED
+	.poll		= lwip_posix_socket_poll,
+#endif /* CONFIG_LIBPOSIX_SOCKET_POLLED */
 	.poll_setup	= lwip_posix_socket_poll_setup,
 };
 

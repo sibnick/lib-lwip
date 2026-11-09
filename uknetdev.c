@@ -92,6 +92,11 @@ struct lwip_netdev_data {
 	char *_name; /* Thread name */
 	struct uk_sched *sched; /* Scheduler information */
 #endif /* CONFIG_HAVE_SCHED */
+#if LWIP_IPV4
+	/* Last IPv4 address for which a gratuitous ARP was sent.
+	 * Zero means no gratuitous ARP was sent yet. */
+	ip4_addr_t last_grat_arp_ip;
+#endif /* LWIP_IPV4 */
 };
 
 /*
@@ -105,6 +110,19 @@ UK_CTASSERT((sizeof(struct lwip_netdev_data)) <= CONFIG_UK_NETDEV_SCRATCH_SIZE);
 
 #define netif_to_uknetdev(nf) \
 	((struct uk_netdev *) (nf)->state)
+
+/*
+ * TODO: report the real link state. The pinned unikraft 0.21 core
+ * exports no link-state getter in uk_netdev, so this stub always
+ * reports link up. The link-down branches in uknetdev_poll() and
+ * uknetdev_init() stay dormant with it. Drivers report link up at
+ * probe, so current devices match this value. Switch the body to a
+ * real uk_netdev link-state call when the core exports one.
+ */
+static inline int uk_netdev_link_state_get(struct uk_netdev *dev __maybe_unused)
+{
+	return 1;
+}
 
 static uint16_t netif_alloc_rxpkts(void *argp, struct uk_netbuf *nb[],
 				   uint16_t count)
@@ -301,6 +319,7 @@ static void uknetdev_input(struct uk_netdev *dev,
 void uknetdev_poll(struct netif *nf)
 {
 	struct uk_netdev *dev;
+	int link_up;
 
 	UK_ASSERT(nf);
 	/*
@@ -315,9 +334,60 @@ void uknetdev_poll(struct netif *nf)
 	UK_ASSERT(dev);
 
 	uknetdev_input(dev, 0, nf);
+
+	link_up = uk_netdev_link_state_get(dev);
+	if (link_up && !netif_is_link_up(nf))
+		netif_set_link_up(nf);
+	else if (!link_up && netif_is_link_up(nf))
+		netif_set_link_down(nf);
 }
 
 #ifdef CONFIG_LWIP_NOTHREADS
+#if LWIP_IPV4 && LWIP_ARP
+/*
+ * Send a Gratuitous ARP for the current IPv4 address of the netif.
+ *
+ * A reused IP address may leave stale entries in the neighbor tables
+ * of the other hosts on the segment. Broadcasting the "this IP is at
+ * this MAC" mapping from the new owner updates those tables. The
+ * Gratuitous ARP goes out when the interface comes up with an
+ * address and again whenever the address changes (for example a new
+ * DHCP lease).
+ */
+static void uknetdev_send_gratuitous_arp(struct netif *nf)
+{
+	struct uk_netdev *dev;
+	struct lwip_netdev_data *lwip_data;
+	ip4_addr_t ip;
+
+	UK_ASSERT(nf);
+	dev = netif_to_uknetdev(nf);
+	UK_ASSERT(dev);
+	lwip_data = (struct lwip_netdev_data *)dev->scratch_pad;
+
+	if (!netif_is_link_up(nf)) {
+		lwip_data->last_grat_arp_ip.addr = 0;
+		return;
+	}
+
+	if (!netif_is_up(nf) || !(nf->flags & NETIF_FLAG_ETHARP))
+		return;
+
+	ip = *netif_ip4_addr(nf);
+	if (ip4_addr_isany_val(ip))
+		return;
+
+	/* ip4_addr_cmp expands without outer parentheses. Comparing its
+	 * result to zero inverts the test. Compare the fields directly.
+	 */
+	if (ip.addr == lwip_data->last_grat_arp_ip.addr)
+		return;
+
+	lwip_data->last_grat_arp_ip = ip;
+	etharp_gratuitous(nf);
+}
+#endif /* LWIP_IPV4 && LWIP_ARP */
+
 void uknetdev_poll_all(void)
 {
 	struct netif *nf;
@@ -330,8 +400,14 @@ void uknetdev_poll_all(void)
 	 */
 	NETIF_FOREACH(nf) {
 		if (nf->name[0] == UKNETDEV_NETIF_NAME0
-		    && nf->name[1] == UKNETDEV_NETIF_NAME1)
+		    && nf->name[1] == UKNETDEV_NETIF_NAME1) {
 			uknetdev_poll(nf);
+#if LWIP_IPV4 && LWIP_ARP
+			/* Announce the address when the interface comes up
+			 * or the address changes. */
+			uknetdev_send_gratuitous_arp(nf);
+#endif /* LWIP_IPV4 && LWIP_ARP */
+		}
 	}
 }
 
@@ -485,6 +561,9 @@ err_t uknetdev_init(struct netif *nf)
 	if (!lwip_data->dev_info.max_rx_queues
 	    || !lwip_data->dev_info.max_tx_queues)
 		return ERR_IF;
+#if LWIP_IPV4
+	lwip_data->last_grat_arp_ip.addr = 0;
+#endif /* LWIP_IPV4 */
 #if CONFIG_LWIP_UKNETDEV_POLLONLY
 	/* Unset receive interrupt support: We force polling mode */
 	lwip_data->dev_info.features &= ~UK_NETDEV_F_RXQ_INTR;
@@ -583,8 +662,11 @@ err_t uknetdev_init(struct netif *nf)
 
 	/* Device capabilities */
 	netif_set_flags(nf, (NETIF_FLAG_BROADCAST
-			     | NETIF_FLAG_ETHARP
-			     | NETIF_FLAG_LINK_UP));
+			     | NETIF_FLAG_ETHARP));
+	if (uk_netdev_link_state_get(dev))
+		netif_set_link_up(nf);
+	else
+		netif_set_link_down(nf);
 	LWIP_DEBUGF(NETIF_DEBUG,
 		    ("%s: %c%c%u: flags: %"PRIx8"\n",
 		     __func__, nf->name[0], nf->name[1], nf->num, nf->flags));
