@@ -55,6 +55,16 @@
 
 #include <uk/essentials.h>
 
+/*
+ * The branches below read CONFIG_LWIP_UKNETDEV_POLLRX as 0 or 1. A
+ * kernel with the option off does not define the symbol at all, so
+ * give that case the value 0. Ticket eae6a73726 exposed this while
+ * building the first threaded, interrupt-driven gVNIC sample.
+ */
+#ifndef CONFIG_LWIP_UKNETDEV_POLLRX
+#define CONFIG_LWIP_UKNETDEV_POLLRX 0
+#endif
+
 #if CONFIG_LWIP_NOTHREADS && LWIP_PERCORE
 #include "lwip_percore.h"
 #include <uk/arch/spinlock.h>
@@ -563,7 +573,20 @@ static void uknetdev_updown(struct netif *nf)
 	/* Enable and disable interrupts according to netif's up/down status */
 
 	if (nf->flags & NETIF_FLAG_UP) {
-		if (uk_netdev_rxintr_supported(lwip_data->dev_info.features)) {
+		/*
+		 * CONFIG_LWIP_UKNETDEV_POLLRX: skip interrupt mode and
+		 * drive this netif from the poll thread in the else
+		 * branch below. The GCP legacy virtio-net device
+		 * (1af4:1000) under KVM never raises RX interrupts to
+		 * the guest, so the interrupt-driven dispatcher path
+		 * leaves the receive ring undrained. Measured in
+		 * diagnostic run ukg-1102-225945-367273: RX stayed
+		 * zero under client SYN load while the polled canary
+		 * served the same subnet. Ticket 4ecf9dcedf. Keep this
+		 * test in sync with the down branch.
+		 */
+		if (uk_netdev_rxintr_supported(lwip_data->dev_info.features)
+		    && !CONFIG_LWIP_UKNETDEV_POLLRX) {
 			ret = uk_netdev_rxq_intr_enable(dev, 0);
 			if (ret < 0) {
 				LWIP_DEBUGF(NETIF_DEBUG,
@@ -610,7 +633,12 @@ static void uknetdev_updown(struct netif *nf)
 		 * TODO:
 		 * Cleanup the thread on stopping the network interface.
 		 */
-		if (uk_netdev_rxintr_supported(lwip_data->dev_info.features)) {
+		/* In sync with the up branch: with
+		 * CONFIG_LWIP_UKNETDEV_POLLRX interrupt mode was never
+		 * enabled, so there is nothing to disable here.
+		 */
+		if (uk_netdev_rxintr_supported(lwip_data->dev_info.features)
+		    && !CONFIG_LWIP_UKNETDEV_POLLRX) {
 			uk_netdev_rxq_intr_disable(dev, 0);
 			LWIP_DEBUGF(NETIF_DEBUG,
 					("%s: %c%c%u: Disabled rx interrupts on netdev %u\n",

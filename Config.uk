@@ -361,6 +361,19 @@ if LWIP_SOCKET
 			Default 2, maximum 5.
 endif
 
+config LWIP_UKNETDEV_POLLRX
+	bool "Force polled RX delivery on uknetdev interfaces"
+	default n
+	help
+		Deliver received packets through the per-netif poll thread
+		even when the device reports RX-interrupt support. On the
+		Google Cloud Compute Engine legacy virtio-net device
+		(1af4:1000) under KVM the device never raises RX interrupts
+		to the guest, so the interrupt-driven dispatcher path
+		starves and the receive ring is never drained. Polled
+		delivery is the pattern every proven cloud gate uses.
+		Ticket 4ecf9dcedf.
+
 menuconfig LWIP_DEBUG
 	bool "Debug messages"
 	default n
