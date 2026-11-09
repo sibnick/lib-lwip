@@ -55,6 +55,11 @@
 
 #include <uk/essentials.h>
 
+#ifdef CONFIG_LIBUKNETDEV_DISPATCHERTHREADS
+#include <uk/sched.h>
+#include <uk/sched_impl.h>
+#endif /* CONFIG_LIBUKNETDEV_DISPATCHERTHREADS */
+
 /*
  * The branches below read CONFIG_LWIP_UKNETDEV_POLLRX as 0 or 1. A
  * kernel with the option off does not define the symbol at all, so
@@ -138,17 +143,11 @@ UK_CTASSERT((sizeof(struct lwip_netdev_data)) <= CONFIG_UK_NETDEV_SCRATCH_SIZE);
 	((struct uk_netdev *) (nf)->state)
 
 /*
- * TODO: report the real link state. The pinned unikraft 0.21 core
- * exports no link-state getter in uk_netdev, so this stub always
- * reports link up. The link-down branches in uknetdev_poll() and
- * uknetdev_init() stay dormant with it. Drivers report link up at
- * probe, so current devices match this value. Switch the body to a
- * real uk_netdev link-state call when the core exports one.
+ * uk_netdev_link_state_get() comes from the unikraft core. The
+ * feature/ena-gcp-common core branch adds the optional
+ * link_state_get driver operation, so the ENA driver reports the
+ * real link state here. Drivers without the op report link up.
  */
-static inline int uk_netdev_link_state_get(struct uk_netdev *dev __maybe_unused)
-{
-	return 1;
-}
 
 #define UKNETDEV_TX_MAX_RETRIES 1000
 
@@ -587,6 +586,40 @@ static void uknetdev_updown(struct netif *nf)
 		 */
 		if (uk_netdev_rxintr_supported(lwip_data->dev_info.features)
 		    && !CONFIG_LWIP_UKNETDEV_POLLRX) {
+#ifdef CONFIG_LIBUKNETDEV_DISPATCHERTHREADS
+			{
+				/*
+				 * One dispatcher thread per RX queue, each bound to
+				 * its own core. Enable the per-queue interrupt of
+				 * every queue so that each dispatcher is woken by its
+				 * own MSI-X.
+				 */
+				unsigned int q;
+				int flush = 0;
+
+				for (q = 0; q < lwip_data->nb_rxq; q++) {
+					ret = uk_netdev_rxq_intr_enable(dev, q);
+					if (ret < 0) {
+						LWIP_DEBUGF(NETIF_DEBUG,
+							("%s: %c%c%u: Failed to enable rx interrupt mode on queue %u of netdev %u\n",
+							 __func__, nf->name[0], nf->name[1],
+							 nf->num, q, uk_netdev_id_get(dev)));
+					} else {
+						LWIP_DEBUGF(NETIF_DEBUG,
+							("%s: %c%c%u: Enabled rx interrupt mode on queue %u of netdev %u\n",
+							 __func__, nf->name[0], nf->name[1],
+							 nf->num, q, uk_netdev_id_get(dev)));
+						if (ret == 1)
+							flush = 1;
+					}
+				}
+
+				/* The device asked for a flush before interrupts. */
+				if (flush)
+					uknetdev_poll(nf);
+				return;
+			}
+#else  /* CONFIG_LIBUKNETDEV_DISPATCHERTHREADS */
 			ret = uk_netdev_rxq_intr_enable(dev, 0);
 			if (ret < 0) {
 				LWIP_DEBUGF(NETIF_DEBUG,
@@ -613,6 +646,7 @@ static void uknetdev_updown(struct netif *nf)
 				 */
 				uknetdev_poll(nf);
 			}
+#endif /* CONFIG_LIBUKNETDEV_DISPATCHERTHREADS */
 		} else {
 #ifdef CONFIG_HAVE_SCHED
 			LWIP_DEBUGF(NETIF_DEBUG,
@@ -639,11 +673,26 @@ static void uknetdev_updown(struct netif *nf)
 		 */
 		if (uk_netdev_rxintr_supported(lwip_data->dev_info.features)
 		    && !CONFIG_LWIP_UKNETDEV_POLLRX) {
+#ifdef CONFIG_LIBUKNETDEV_DISPATCHERTHREADS
+			unsigned int q;
+
+			/* Each dispatcher is woken by its own per-queue
+			 * interrupt, so disable the interrupt of every
+			 * queue. */
+			for (q = 0; q < lwip_data->nb_rxq; q++) {
+				uk_netdev_rxq_intr_disable(dev, q);
+				LWIP_DEBUGF(NETIF_DEBUG,
+						("%s: %c%c%u: Disabled rx interrupts on queue %u of netdev %u\n",
+						 __func__, nf->name[0], nf->name[1],
+						 nf->num, q, uk_netdev_id_get(dev)));
+			}
+#else  /* CONFIG_LIBUKNETDEV_DISPATCHERTHREADS */
 			uk_netdev_rxq_intr_disable(dev, 0);
 			LWIP_DEBUGF(NETIF_DEBUG,
 					("%s: %c%c%u: Disabled rx interrupts on netdev %u\n",
 					 __func__, nf->name[0], nf->name[1],
 					 nf->num, uk_netdev_id_get(dev)));
+#endif /* CONFIG_LIBUKNETDEV_DISPATCHERTHREADS */
 		}
 
 	}
@@ -664,6 +713,27 @@ static void uknetdev_updown(struct netif *nf)
  * store lwip_data.
  */
 UK_CTASSERT(sizeof(struct lwip_netdev_data) <= CONFIG_LWIP_UKNETDEV_SCRATCH);
+
+#ifdef CONFIG_LIBUKNETDEV_DISPATCHERTHREADS
+/*
+ * Return the scheduler that owns vCPU idx by walking the per-LCPU
+ * scheduler list. Falls back to the current scheduler when there are
+ * fewer online cores than idx + 1 (single-core fallback).
+ */
+static struct uk_sched *uknetdev_lcpu_sched(unsigned int idx)
+{
+	struct uk_sched *s = uk_sched_head;
+	unsigned int i;
+
+	for (i = 0; s && i < idx; i++)
+		s = s->next;
+
+	if (!s)
+		s = uk_sched_current();
+
+	return s;
+}
+#endif /* CONFIG_LIBUKNETDEV_DISPATCHERTHREADS */
 
 err_t uknetdev_init(struct netif *nf)
 {
@@ -799,7 +869,9 @@ err_t uknetdev_init(struct netif *nf)
 		rxq_conf.callback = uknetdev_input;
 		rxq_conf.callback_cookie = nf;
 #ifdef CONFIG_LIBUKNETDEV_DISPATCHERTHREADS
-		rxq_conf.s = uk_sched_current();
+		/* One dispatcher thread per RX queue, each bound to
+		 * its own core so RX is spread across the available CPUs. */
+		rxq_conf.s = uknetdev_lcpu_sched(i);
 		if (!rxq_conf.s)
 			return ERR_IF;
 
