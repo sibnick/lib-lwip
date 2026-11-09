@@ -57,8 +57,22 @@ err_t uknetdev_init(struct netif *nf);
  */
 void uknetdev_poll(struct netif *nf);
 
+/*
+ * Poll one receive queue of the uknetdev-backed interface. Returns the
+ * number of packets taken from the queue. uknetdev_poll() polls queue 0.
+ */
+unsigned int uknetdev_poll_queue(struct netif *nf, uint16_t queue_id);
+
 #ifdef CONFIG_LWIP_NOTHREADS
 void uknetdev_poll_all(void);
+
+/*
+ * Poll one receive queue of every uknetdev-backed interface. Returns the
+ * number of packets taken from the queue. uknetdev_poll_all() polls
+ * queue 0. In the per-core mode (LWIP_PERCORE) each core calls this for
+ * its own queue id.
+ */
+unsigned int uknetdev_poll_rxqueue(uint16_t queue_id);
 #endif /* CONFIG_LWIP_NOTHREADS */
 
 struct netif *uknetdev_addif(struct uk_netdev *n

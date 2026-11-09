@@ -91,6 +91,21 @@ void sys_free(void *ptr);
 #define DEFAULT_ACCEPTMBOX_SIZE (TCPIP_MBOX_SIZE)
 #endif /* CONFIG_LWIP_NOTHREADS */
 
+/*
+ * Per-core memp pools are split across CPU cores (LWIP_CORE_MAX).
+ * lwip_init() calls sys_timeouts_init(), which registers every enabled
+ * cyclic timer on the boot core at once. The lwIP default
+ * MEMP_NUM_SYS_TIMEOUT sizes one global pool, so the per-core split can
+ * leave a core with too few slots. At boot that core then fails the first
+ * extra allocation and crashes: "pool MEMP_SYS_TIMEOUT is empty".
+ * Size the pool by the core count and add headroom for the cyclic timers
+ * plus on-demand TCP and DHCP timers. [Ticket 3dc1f3f6b6]
+ */
+#if defined(LWIP_PERCORE) && defined(CONFIG_UKPLAT_CPU_MAXCOUNT) && \
+    !defined(MEMP_NUM_SYS_TIMEOUT)
+#define MEMP_NUM_SYS_TIMEOUT (16 * CONFIG_UKPLAT_CPU_MAXCOUNT)
+#endif
+
 /**
  * Pbuf options
  */
